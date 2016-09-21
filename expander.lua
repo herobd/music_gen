@@ -115,6 +115,7 @@ function input_labels_from_file(file,splitTest)
         local lastChar='$'
         for t =1, utf8.len(labelWords[i]) do
             local labelTensor = torch.Tensor(1,labelCounter+1):zero()
+            --local labelTensor = torch.Tensor(1,labelCounter):zero()
             local uc=utf8.sub(labelWords[i],t,t)
             local c=utf8.lower(uc)
             labelTable[t]=labelChars[c]
@@ -151,6 +152,7 @@ function input_labels_from_file(file,splitTest)
         local lastChar='$'
         for t =1, utf8.len(labelWords[i]) do
             local labelTensor = torch.Tensor(1,labelCounter+1):zero()
+            --local labelTensor = torch.Tensor(1,labelCounter):zero()
             local uc=utf8.sub(labelWords[i],t,t)
             local c=utf8.lower(uc)
             labelTable[t]=labelChars[c]
@@ -344,7 +346,7 @@ local stepmodule = nn.Sequential() -- applied at each time-step
 --local inputsize = trainInputVectors[0]:size(2) --the number of different chars
 local lastLayerSize = inputsize
 for i,hiddensize in ipairs(opt.hiddensize) do 
-   lastLayerSize = lastLayerSize+nn.OneToManySequencer.timeSize
+   lastLayerSize = lastLayerSize+nn.BiOneToManySequencer.timeSize
    local rnn
    if opt.gru then -- Gated Recurrent Units
       rnn = nn.GRU(lastLayerSize, hiddensize, nil, opt.dropout/2)
@@ -373,6 +375,7 @@ end
 
 -- output layer (not input size, that variable is holding the last layers output size)
 stepmodule:add(nn.Linear(lastLayerSize, outputsize+1)) --+1 for END token
+--single OneToMany uses this
 --stepmodule:add(nn.PartailSoftMax(1))
 
 --if opt.cuda then
@@ -393,6 +396,7 @@ except[2]=(outputsize+1)*2 --start flag
 endmodule:add(nn.AllExcept(nn.Linear(outputsize*2, outputsize),except))
 endmodule:add(nn.PartailSoftMax(2)) --we exclude the flags from the SoftMax
 lm:add(nn.SharedParallelTable(endmodule,timeLen))
+--]]
 
 -- remember previous state between batches: Not needed as each batch is a line
 --lm:remember((opt.lstm or opt.gru) and 'both' or 'eval')
@@ -546,7 +550,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
             
       end
 
-      if i % 1000 == 0 then
+      if i % 100 == 0 then
          collectgarbage()
       end
 
