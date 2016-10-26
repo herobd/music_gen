@@ -18,22 +18,35 @@ Each sequence is begun with <start_token> syl/word with some rest notes
 
 Parsed data should look like:
 IN (table of tensors):
-1: <word vec>+<syb vec>
-2: <word vec>+<syb vec>
+1: syb_word_pos syb_line_pos <word vec> <syb vec>
+2: syb_word_pos syb_line_pos <word vec> <syb vec>
 ...
-LABEL (table of tensors):
-1: pitch
+LABEL (table of tensors at time slice of 1/(16*3)):
+1: pitch_vec END (START)
 ]]
 
 require 'paths'
 local utf8 = require 'lua-utf8'
-local dl = require 'dataload'
 
-version = 0.1
-useBi=false
+local lengthTable = {
+    ['zero'] = 0,
+    ['sixteenth'] = 3,
+    ['half'] = 24,
+    ['whole'] = 48,
+    ['triplet-eighth'] = 4,
+    ['eighth'] = 6,
+    ['quarter'] = 12,
+    ['triplet-quarter'] = 8
+}
 
-function isUpper(s)
-    return s == utf8.upper(s)
+function getData(fileName,testSplit,batchSize,useBi)
+
+    local inputVectorSize, inputs, labelVectorSize, labels = parseMusicFile(fileName,useBi)
+    local trainInput,trainLabel,testInput,testLabel = splitShuffleData(inputs,labels,testSplitPortion)
+    local trainBatches = make_batches(trainInput, trainLabels, batchSize)
+    local testBatches = make_batches(testInput, testLabels, batchSize)
+
+    return inputVectorSize, labelVectorSize, trainBatches, testBatches
 end
 
 function file_exists(name)
@@ -65,7 +78,7 @@ function shuffleTables( t1, t2 )
     end
 end
 
-function parseMusicFile(file)
+function parseMusicFile(file, useBi)
     local lines = lines_from(file)
     local word_vec_len = tonumber(string.match(lines[1],'.*: (\d+)'))
     local syb_vec_len = tonumber(string.match(lines[2],'.*: (\d+)'))
@@ -81,164 +94,116 @@ function parseMusicFile(file)
         table.insert(note_values,i)
     end
 
-    for i=8, #lines do
-
+    local inputVectorSize = 2+word_vec_len+syb_vec_len
+    local labelVectorSize = max_pitch-min_pitch +3 --+1 for pitch range, +1 for rest, +1 for END token
+    if useBi then
+        labelVectorSize = labelVectorSize +1 --+1 for START token
     end
-    
+    local i=8
+    local inTen=false
+    local labelVecs={}
+    local inputs = {}
+    local labels = {}
+    while  i<#lines do
+        if string.len(lines[i])>0 then
+            local syb, word, syllable_word_pos, num_syllables_in_word, syllable_line_pos, num_syllables_in_line, word_syb_vecS = string.match(lines[i],'(\w+)\s+(\w+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+)')
+            if syb==start_token then
+                if inTen ~= false then
+                    table.insert(inputs,inTen)
+                    inTen=false
+                end
+                if #labelVecs>0 then
+                    table.insert(labels,labelVecs)
+                    labelTens = {}
+                end
+            end 
+            local inVec = torch.Tensor(1,inputVectorSize)
+            inVec[1][1] = tonumber(syllable_word_pos)/tonumber(num_syllables_in_word)
+            inVec[1][2] = tonumber(syllable_line_pos)/tonumber(num_syllables_in_line)
+            local j=3
+            for w in word_syb_vecS:gmatch("%S+") do
+                inVec[i][j]=tonumber(w)
+                j=j+1
+            end
+            assert(j-1==inputVectorSize)
+            if inTen==false then
+                inTen = inVec
+            else
+                inTen = torch.cat(inTen,inVec,1)
+            end
 
-function input_labels_from_file(file,splitTest)
-    local lines = lines_from(file)
-    local inputCounter=0
-    local labelCounter=1
-    local inputWords={}
-    local labelWords={}
-    local inputChars={} --{ [0]=' ' }
-    local labelChars={}
-    for i,line in pairs(lines) do
-        local s = {}
-        for x in utf8.gmatch(line, "%S+") do
-            table.insert(s,x)
-        end
-        --print(s)
-        local input=s[1]
-        table.insert(inputWords,input)
-        for c in utf8.gmatch(input,".") do
-            if not inputChars[c] then
-                inputChars[c]=inputCounter
-                inputCounter = inputCounter+1
+            local begin = #labelVecs
+            while i<#lines do
+                local pitch, lengthS, measure, beat = string.match(lines[i],'(-?\d+)\s+(\w+)\s+(\d+)\s+(\d*.?\d+)')
+                if pitch == stop_pitch then
+                    break
+                end
+
+                local labelVec = torch.zeros(1,labelVectorSize)
+                if pitch ~= rest_pitch then
+                    labelVec[1][pitch-minPitch+1]=1
+                else
+                    labelVec[1][max_pitch-minPitch+2]=1
+                end
+
+                local length = lengthTable[lengthS]
+                for j=1, length do
+                    table.insert(labelVecs,labelVec)
+                end
+                i = i+1
             end
-        end
-        local label=s[2]
-        table.insert(labelWords,label)
-        for uc in utf8.gmatch(label,".") do
-            local c = utf8.lower(uc);
-            if not labelChars[c] then 
-                labelChars[c]=labelCounter
-                labelCounter = labelCounter+1
+            if useBi then
+                labelVecs[begin+1] = labelVecs[begin+1]:clone()
+                labelVecs[begin+1][1][labelVectorSize]=1 --START token
             end
+            labelVecs[#labelVecs] = labelVecs[#labelVecs]:clone()
+            labelVecs[#labelVecs][1][max_pitch-min_pitch +2]=1 --END token
+
         end
+        i = i+1
     end
-    
-    --shuffleTables(inputWords,labelWords)
-    local splitAt = math.floor(splitTest*#inputWords)
-    
-    trainInputVectors= {}
-    trainInputWords= {}
-    trainLabelTables= {}
-    trainLabelTensors= {}
-    trainLabelWords={}
-    testInputVectors= {}
-    testInputWords= {}
-    testLabelTables= {}
-    testLabelTensors= {}
-    testLabelWords= {}
-    
-    
-    
+    table.insert(inputs,inTen)
+    table.insert(labels,labelVecs)
+
+    return inputVectorSize, inputs, labelVectorSize, labels
+end 
+
+function splitShuffleData(inputs,labels,testSplitPortion)
+
+    local splitAt = math.floor(testSplitPortion*#inputs)
+    local trainInputs = {}
+    local trainLabels = {}
+    local testInputs = {}
+    local testLabels = {}
+
     for i = 1, splitAt-1 do
-        local paddedLen = utf8.len(inputWords[i]) --*4 + 3 --math.max(utf8.len(inputWords[i]),utf8.len(labelWords[i]))+2 --math.max(utf8.len(inputWords[i])*3+5,10)
-        table.insert(testInputWords,inputWords[i])
-        local inputVec = torch.zeros(paddedLen,inputCounter)
-        for t =1, utf8.len(inputWords[i]) do
-            local c=utf8.sub(inputWords[i],t,t)
-            --print (inputVec,t,inputWords[i],c,inputChars[c],inputCounter)
-            inputVec[t][inputChars[c]+1]=1
-            
-        end
-        --[[for t =1+utf8.len(inputWords[i]), paddedLen do
-            inputVec[t][1]=1
-        end]]
-        table.insert(testInputVectors,inputVec)
-        
-        table.insert(testLabelWords,labelWords[i])
-        local labelTable = {}
-        local labelTensors = {}
-        local lastChar='$'
-        local labelTensorSize=labelCounter --this has the +1 for STOP token
-        if useBi then
-            labelTensorSize=labelTensorSize+1 --for START token
-        end
-        for t =1, utf8.len(labelWords[i]) do
-            local labelTensor = torch.Tensor(1,labelTensorSize):zero()
-            local uc=utf8.sub(labelWords[i],t,t)
-            local c=utf8.lower(uc)
-            labelTable[t]=labelChars[c]
-            labelTensor[1][labelChars[c]]=1
-            if isUpper(uc) then
-                labelTensor[1][labelCounter]=1
-            end
+        table.insert(testInputs,inputs[i])
+        table.insert(testLabels,labels[i])
+    end
+    for i = splitAt, #inputs do
+        table.insert(trainInputs,inputs[i])
+        table.insert(trainLabels,labels[i])
+    end
+    shuffleTables(trainInputs,trainLabels)
+    shuffleTables(testInputs,testLabels)
 
-            if useBi and lastChar~=c then --this is a start char
-                labelTensor[1][labelCounter+1]=1
-            end
-            lastChar=c
-            labelTensors[t]=labelTensor
-        end
-        table.insert(testLabelTables,labelTable)
-        table.insert(testLabelTensors,labelTensors)
-    end
-    for i = splitAt, #inputWords do
-        local paddedLen = utf8.len(inputWords[i]) --*4 + 3 --math.max(utf8.len(inputWords[i]),utf8.len(labelWords[i]))+2 --math.max(utf8.len(inputWords[i])*3+5,10)
-        table.insert(trainInputWords,inputWords[i])
-        --print(i,inputWords[i])
-        local inputVec = torch.zeros(paddedLen,inputCounter)
-        for t =1, utf8.len(inputWords[i]) do
-            local c=utf8.sub(inputWords[i],t,t)
-            inputVec[t][inputChars[c]+1]=1
-        end
-        --[[for t =1+utf8.len(inputWords[i]), paddedLen do
-            inputVec[t][1]=1
-        end]]
-        table.insert(trainInputVectors,inputVec)
-        
-        table.insert(trainLabelWords,labelWords[i])
-        local labelTable = {}
-        local labelTensors = {}
-        local lastChar='$'
-        local labelTensorSize=labelCounter --this has the +1 for STOP token
-        if useBi then
-            labelTensorSize=labelTensorSize+1 --for START token
-        end
-        for t =1, utf8.len(labelWords[i]) do
-            local labelTensor = torch.Tensor(1,labelTensorSize):zero()
-            local uc=utf8.sub(labelWords[i],t,t)
-            local c=utf8.lower(uc)
-            labelTable[t]=labelChars[c]
-            labelTensor[1][labelChars[c]]=1
-            if isUpper(uc) then
-                labelTensor[1][labelCounter]=1
-            end
-            if useBi and lastChar~=c then --this is a startChar
-                labelTensor[1][labelCounter+1]=1
-            end
-            lastChar=c
-            labelTensors[t]=labelTensor
-        end
-        table.insert(trainLabelTables,labelTable)
-        table.insert(trainLabelTensors,labelTensors)
-    end
-    
-    return trainInputVectors, trainInputWords, trainLabelTensors, trainLabelWords,
-           testInputVectors, testInputWords, testLabelTensors, testLabelWords,
-           inputCounter, labelCounter-1, labelChars
+    return trainInputs,trainLabels,testInputs,testLabels
 end
 
---This both breaks the tables into batches, but formats them into what warp-ctc expects
-function make_batches(inputVectors, inputWords, labelTables, labelWords, batchSize)
+
+
+--This both breaks the tables into batches, and formats them into what warp-ctc expects
+function make_batches(inputVectors, labelTables, batchSize)
     local batchesRet={}
     --local labelRet={}
     
     local batchInput={}
     local batchLabel={}
-    local batchInputW={}
-    local batchLabelW={}
     local maxLength=0
     for i=1, #inputVectors do
     --for i=1, math.min(100,#inputVectors) do
         table.insert(batchInput,inputVectors[i])
         table.insert(batchLabel,labelTables[i])
-        table.insert(batchInputW,inputWords[i])
-        table.insert(batchLabelW,labelWords[i])
         if inputVectors[i]:size(1)>maxLength then
             maxLength=inputVectors[i]:size(1)
         end
@@ -262,8 +227,6 @@ function make_batches(inputVectors, inputWords, labelTables, labelWords, batchSi
             
             batchInput={}
             batchLabel={}
-            batchInputW={}
-            batchLabelW={}
             maxLength=0
         end
     end
@@ -271,100 +234,4 @@ function make_batches(inputVectors, inputWords, labelTables, labelWords, batchSi
     return batchesRet
 end
 
-function table_invert(t)
-   local s={}
-   for k,v in pairs(t) do
-     s[v]=k
-   end
-   return s
-end
 
-function decode(activations,indexToChars,nInBatch)
-    local decoded=''
-    local blank=true
-    local lastC
-    for t,v in pairs(activations) do
-        local acts = v[nInBatch]
-        local cap = acts[#indexToChars +1]>0.5
-        acts[#indexToChars +1]=0;
-        local str=false
-        if useBi then
-            str = acts[#indexToChars +2]>0.5
-            acts[#indexToChars +2]=0;
-        end
-        local maxs, indices = torch.max(acts,1)
-        local c = indexToChars[ indices[1] ]
-        if cap then
-            c=utf8.upper(c)
-        end
-        if useBi and str then
-            c='^'..c
-        end
-        decoded = decoded..c
-    end
-    return decoded
-end
-
-
---[[ command line arguments ]]--
-cmd = torch.CmdLine()
-cmd:text()
-cmd:text('Train a English to IPA translator')
-cmd:text('Example:')
-cmd:text('th simple_trans.lua --cuda --device 2 --progress --cutoff 4 ')
-cmd:text("th simple_trans.lua --progress --cuda --lstm  --hiddensize '{200,200}' --batchsize 20 --startlr 1 --cutoff 5 --maxepoch 13 --schedule '{[5]=0.5,[6]=0.25,[7]=0.125,[8]=0.0625,[9]=0.03125,[10]=0.015625,[11]=0.0078125,[12]=0.00390625}'")
-cmd:text("th simple_trans.lua --progress --cuda --lstm  --uniform 0.04 --hiddensize '{1500,1500}' --batchsize 20 --startlr 1 --cutoff 10 --maxepoch 50 --schedule '{[15]=0.87,[16]=0.76,[17]=0.66,[18]=0.54,[19]=0.43,[20]=0.32,[21]=0.21,[22]=0.10}' -dropout 0.65")
-cmd:text('Options:')
--- training
-cmd:option('--data', 'data.txt', 'path to dataset')
-cmd:option('--startlr', 0.05, 'learning rate at t=0')
-cmd:option('--minlr', 0.00001, 'minimum learning rate')
-cmd:option('--saturate', 400, 'epoch at which linear decayed LR will reach minlr')
-cmd:option('--schedule', '', 'learning rate schedule. e.g. {[5] = 0.004, [6] = 0.001}')
-cmd:option('--momentum', 0.9, 'momentum')
-cmd:option('--maxnormout', -1, 'max l2-norm of each layer\'s output neuron weights')
-cmd:option('--cutoff', -1, 'max l2-norm of concatenation of all gradParam tensors')
---cmd:option('--batchSize', 32, 'number of examples per batch')
-cmd:option('--cuda', false, 'use CUDA')
-cmd:option('--device', 1, 'sets the device (GPU) to use')
-cmd:option('--maxepoch', 1000, 'maximum number of epochs to run')
-cmd:option('--earlystop', 50, 'maximum number of epochs to wait to find a better local minima for early-stopping')
-cmd:option('--progress', false, 'print progress bar')
-cmd:option('--silent', false, 'don\'t print anything to stdout')
-cmd:option('--uniform', 0.1, 'initialize parameters using uniform distribution between -uniform and uniform. -1 means default initialization')
--- rnn layer 
-cmd:option('--lstm', false, 'use Long Short Term Memory (nn.LSTM instead of nn.Recurrent)')
-cmd:option('--gru', false, 'use Gated Recurrent Units (nn.GRU instead of nn.Recurrent)')
---cmd:option('--seqlen', 5, 'sequence length : back-propagate through time (BPTT) for this many time-steps')
-cmd:option('--hiddensize', '{200}', 'number of hidden units used at output of each recurrent layer. When more than one is specified, RNN/LSTMs/GRUs are stacked')
-cmd:option('--dropout', 0, 'apply dropout with this probability after each rnn layer. dropout <= 0 disables it.')
--- data
-cmd:option('--batchsize', 1, 'number of examples per batch')
-cmd:option('--splittest', 0.1, 'What portion of the dataset should be reserved for testing (validation).')
-cmd:option('--trainsize', -1, 'number of train examples seen between each epoch')
-cmd:option('--validsize', -1, 'number of valid examples used for early stopping and cross-validation') 
-cmd:option('--savepath', paths.concat(dl.SAVE_PATH, 'simple_trans'), 'path to directory where experiment log (includes model) will be saved')
-cmd:option('--id', '', 'id string of this experiment (used to name output file) (defaults to a unique id)')
-
-cmd:option('--bi', false, 'use Bidirectional') 
-
-cmd:text()
-local opt = cmd:parse(arg or {})
-opt.hiddensize = loadstring(" return "..opt.hiddensize)()
-opt.schedule = loadstring(" return "..opt.schedule)()
-if not opt.silent then
-   table.print(opt)
-end
-opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-useBi = opt.bi
---[[ data set ]]--
-print('loading dataset')
-trainInputVectors, trainInputWords, trainLabelTables, trainLabelWords, 
-testInputVectors, testInputWords, testLabelTables, testLabelWords, 
-inputsize, outputsize, labelChars = input_labels_from_file(opt.data,opt.splittest)
-local indexToChars= table_invert(labelChars)
-print(indexToChars)
-print('making batches')
-trainSet = make_batches(trainInputVectors,trainInputWords, trainLabelTables,trainLabelWords, opt.batchsize)
-validSet = make_batches(testInputVectors,testInputWords, testLabelTables,testLabelWords, opt.batchsize)
-print('done preparing dataset')

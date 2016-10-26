@@ -10,7 +10,8 @@ require 'AllExcept'
 local utf8 = require 'lua-utf8'
 local dl = require 'dataload'
 
-version = 0
+version = 0.1
+useBi=false
 
 function isUpper(s)
     return s == utf8.upper(s)
@@ -113,8 +114,12 @@ function input_labels_from_file(file,splitTest)
         local labelTable = {}
         local labelTensors = {}
         local lastChar='$'
+        local labelTensorSize=labelCounter --this has the +1 for STOP token
+        if useBi then
+            labelTensorSize=labelTensorSize+1 --for START token
+        end
         for t =1, utf8.len(labelWords[i]) do
-            local labelTensor = torch.Tensor(1,labelCounter+1):zero()
+            local labelTensor = torch.Tensor(1,labelTensorSize):zero()
             local uc=utf8.sub(labelWords[i],t,t)
             local c=utf8.lower(uc)
             labelTable[t]=labelChars[c]
@@ -122,7 +127,8 @@ function input_labels_from_file(file,splitTest)
             if isUpper(uc) then
                 labelTensor[1][labelCounter]=1
             end
-            if lastChar~=c then --this is a start char
+
+            if useBi and lastChar~=c then --this is a start char
                 labelTensor[1][labelCounter+1]=1
             end
             lastChar=c
@@ -149,8 +155,12 @@ function input_labels_from_file(file,splitTest)
         local labelTable = {}
         local labelTensors = {}
         local lastChar='$'
+        local labelTensorSize=labelCounter --this has the +1 for STOP token
+        if useBi then
+            labelTensorSize=labelTensorSize+1 --for START token
+        end
         for t =1, utf8.len(labelWords[i]) do
-            local labelTensor = torch.Tensor(1,labelCounter+1):zero()
+            local labelTensor = torch.Tensor(1,labelTensorSize):zero()
             local uc=utf8.sub(labelWords[i],t,t)
             local c=utf8.lower(uc)
             labelTable[t]=labelChars[c]
@@ -158,7 +168,7 @@ function input_labels_from_file(file,splitTest)
             if isUpper(uc) then
                 labelTensor[1][labelCounter]=1
             end
-            if lastChar~=c then --this is a startChar
+            if useBi and lastChar~=c then --this is a startChar
                 labelTensor[1][labelCounter+1]=1
             end
             lastChar=c
@@ -236,15 +246,18 @@ function decode(activations,indexToChars,nInBatch)
     for t,v in pairs(activations) do
         local acts = v[nInBatch]
         local cap = acts[#indexToChars +1]>0.5
-        local str = acts[#indexToChars +2]>0.5
         acts[#indexToChars +1]=0;
-        acts[#indexToChars +2]=0;
+        local str=false
+        if useBi then
+            str = acts[#indexToChars +2]>0.5
+            acts[#indexToChars +2]=0;
+        end
         local maxs, indices = torch.max(acts,1)
         local c = indexToChars[ indices[1] ]
         if cap then
             c=utf8.upper(c)
         end
-        if str then
+        if useBi and str then
             c='^'..c
         end
         decoded = decoded..c
@@ -293,6 +306,8 @@ cmd:option('--validsize', -1, 'number of valid examples used for early stopping 
 cmd:option('--savepath', paths.concat(dl.SAVE_PATH, 'simple_trans'), 'path to directory where experiment log (includes model) will be saved')
 cmd:option('--id', '', 'id string of this experiment (used to name output file) (defaults to a unique id)')
 
+cmd:option('--bi', false, 'use Bidirectional') 
+
 cmd:text()
 local opt = cmd:parse(arg or {})
 opt.hiddensize = loadstring(" return "..opt.hiddensize)()
@@ -301,7 +316,7 @@ if not opt.silent then
    table.print(opt)
 end
 opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-
+useBi = opt.bi
 --[[ data set ]]--
 print('loading dataset')
 trainInputVectors, trainInputWords, trainLabelTables, trainLabelWords, 
@@ -372,7 +387,7 @@ for i,hiddensize in ipairs(opt.hiddensize) do
 end
 
 -- output layer (not input size, that variable is holding the last layers output size)
-stepmodule:add(nn.Linear(lastLayerSize, outputsize+1)) --+1 for END token
+stepmodule:add(nn.Linear(lastLayerSize, outputsize+1)) --+1 for END or START token
 --stepmodule:add(nn.PartailSoftMax(1))
 
 --if opt.cuda then
@@ -383,15 +398,27 @@ stepmodule:add(nn.Linear(lastLayerSize, outputsize+1)) --+1 for END token
 
 -- encapsulate stepmodule into a Sequencer
 local timeLen=utf8.len(trainLabelWords[1])
-print("creating BiOneToMany with len:",timeLen)
-lm:add(nn.NaN(nn.BiOneToManySequencer(stepmodule,timeLen)))
+if useBi then
+    print("creating BiOneToMany with len:",timeLen)
+    lm:add(nn.NaN(nn.BiOneToManySequencer(stepmodule,timeLen)))
+else
+    print("creating OneToMany with len:",timeLen)
+    lm:add(nn.NaN(nn.OneToManySequencer(stepmodule,timeLen)))
+end
 
 local endmodule = nn.Sequential() -- applied at each time-step, but not recurrently
 local except = {} --we exclude the flags from the combination layer so the gradient flows back directly
 except[1]=outputsize+1 --end flag
-except[2]=(outputsize+1)*2 --start flag
-endmodule:add(nn.AllExcept(nn.Linear(outputsize*2, outputsize),except))
-endmodule:add(nn.PartailSoftMax(2)) --we exclude the flags from the SoftMax
+if useBi then
+    except[2]=(outputsize+1)*2 --start flag
+end
+if useBi then
+    endmodule:add(nn.AllExcept(nn.Linear(outputsize*2, outputsize),except))
+    endmodule:add(nn.PartailSoftMax(2)) --we exclude the flags from the SoftMax
+else
+    endmodule:add(nn.AllExcept(nn.Linear(outputsize, outputsize),except))
+    endmodule:add(nn.PartailSoftMax(1)) --we exclude the flag from the SoftMax
+end
 lm:add(nn.SharedParallelTable(endmodule,timeLen))
 
 -- remember previous state between batches: Not needed as each batch is a line
@@ -488,7 +515,14 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       end
       --]]
       local targets = batch.labels[1]
-      --print ('to:',targets,outputs)
+      --[[print ('to:   -------')
+      for j,v in pairs(targets) do
+          print(v)
+      end
+      print ('out: ------')
+      for j,v in pairs(outputs) do
+          print(v)
+      end --]]
       
       assert(#targets == #outputs,"ERROR, targets and outputs different lengths (time)")
       local err = criterion:forward(outputs, targets)
@@ -497,6 +531,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       --print("acts")
       --sizes comes from earlier
       local gradOutputs = criterion:backward(outputs, targets)
+      --print('outputs:',outputs)
       --print('gradout:',gradOutputs)
       lm:zeroGradParameters()
       lm:backward(batch.inputs, gradOutputs)
