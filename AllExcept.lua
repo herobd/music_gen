@@ -1,3 +1,6 @@
+--This applies the given module to all elements of the tensor execpt those specified.
+--The 'except' values are appended to the end of the vector
+
 local AllExcept, parent = torch.class('nn.AllExcept', 'nn.Module')
 
 function AllExcept:__init(module,except)
@@ -42,9 +45,10 @@ function AllExcept:updateGradInput(input, gradOutput)
     if self.nIn ~= input:size(2) then
         self:setTheRest(input:size(2))
     end
+    --print( self.theRest, self.except )
     local compute = input:index(2,self.theRest) 
     local pass = input:index(2,self.except)
-    self.gradInput = torch.cat(self.module:updateGradInput(compute,gradOutput:narrow(2,1,gradOutput:size(2)-2)),gradOutput:narrow(2,gradOutput:size(2)-2,2),2)
+    self.gradInput = torch.cat(self.module:updateGradInput(compute,gradOutput:narrow(2,1,gradOutput:size(2)-self.except:size(1))),gradOutput:narrow(2,gradOutput:size(2)-self.except:size(1),self.except:size(1)),2)
 
    return self.gradInput
 end
@@ -55,7 +59,7 @@ function AllExcept:accGradParameters(input, gradOutput, scale)
         self:setTheRest(input:size(2))
     end
     local compute = input:index(2,self.theRest) 
-    self.module:accGradParameters(compute,gradOutput:narrow(2,1,gradOutput:size(2)-2),scale)
+    self.module:accGradParameters(compute,gradOutput:narrow(2,1,gradOutput:size(2)-self.except:size(1)),scale)
 
 end
 

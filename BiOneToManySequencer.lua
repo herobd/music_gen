@@ -44,6 +44,7 @@ function BiOneToManySequencer:__init(module,nOut)
    local _ = require 'moses'
    self.dpnn_mediumEmpty = _.clone(self.dpnn_mediumEmpty)
    table.insert(self.dpnn_mediumEmpty, '_output')
+   table.insert(self.dpnn_mediumEmpty, '_outputR')
    -- default is to forget previous inputs before each forward()
    self._remember = 'neither'
 end
@@ -151,26 +152,28 @@ function BiOneToManySequencer:updateOutput(input)
              curData = input[1] --we just use the first data value repeatedly if we run out
          end
       end
-      ----------]]
+      ----------
+      local combTable = {}
       for outStep=1,nOut do
-          self.tableoutput[outStep]=torch.cat(self.tableoutput[outStep],self.tableoutputR[outStep],2)
+            combTable[outStep]=torch.cat(self.tableoutput[outStep],self.tableoutputR[outStep],2)
       end
 
 
 
       if torch.isTensor(input) then
-         self.output = torch.isTensor(self.output) and self.output or self.tableoutput[1].new()
-         self.output:resize(nOut, unpack(self.tableoutput[1]:size():totable()))
+         self.output = torch.isTensor(self.output) and self.output or combTable[1].new()
+         self.output:resize(nOut, unpack(combTable[1]:size():totable()))
          for step=1,nOut do
-            self.output[step]=self.tableoutput[step]
+            self.output[step]=combTable[step]
          end
       else
-            self.output= self.tableoutput
+            self.output= combTable
       end
    else 
       -- EVALUATION
       if not (self._remember == 'eval' or self._remember == 'both') then
          self.module:forget()
+         self.moduleR:forget()
       end
       -- during evaluation, recurrent modules reuse memory (i.e. outputs)
       -- so we need to copy each output into our own table or tensor
@@ -276,7 +279,7 @@ function BiOneToManySequencer:updateOutput(input)
                  curData = input[nData] --we just use the last data value repeatedly if we run out
              end
           end
-          ----------
+          ---------
           dataStep=nData
           curData=input[dataStep]
           outStep=nOut
@@ -303,10 +306,10 @@ function BiOneToManySequencer:updateOutput(input)
                  dataStep = dataStep-1
                  curData = input[dataStep]
              else
-                 curData = input[1] --we just use the first data value repeatedly if we run out
+                 curData = input[1] --we just use the last data value repeatedly if we run out
              end
           end
-          -----------
+          ---------
          -- remove extra output tensors (save for later)
          for i=nOut+1,#self.tableoutput do
             table.insert(self._output, self.tableoutput[i])
@@ -314,12 +317,14 @@ function BiOneToManySequencer:updateOutput(input)
             self.tableoutput[i] = nil
             self.tableoutputR[i] = nil
          end
-
-
-          for outStep=1,nOut do
-              self.tableoutput[outStep]=torch.cat(self.tableoutput[outStep],self.tableoutputR[outStep],2)
-          end
-          self.output = self.tableoutput
+         for i=nOut+1,#self.tableoutputR do
+            table.insert(self._outputR, self.tableoutputR[i])
+            self.tableoutputR[i] = nil
+         end
+         self.output = {} --self.tableoutput
+         for i=1, nOut do
+             self.output[i] = torch.cat(self.tableoutput[i],self.tableoutputR[i],2)
+         end
       end
    end
    
@@ -480,6 +485,7 @@ function BiOneToManySequencer:clearState()
    self.tableoutput = {}
    self.tablegradinput = {}
    self.module:clearState()
+   self._outputR = {}
    self.tableoutputR = {}
    self.tablegradinputR = {}
    self.moduleR:clearState()
